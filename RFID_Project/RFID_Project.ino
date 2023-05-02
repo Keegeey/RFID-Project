@@ -1,233 +1,136 @@
-#include <SPI.h>
-#include <Adafruit_PN532.h>
+#include <WiFiNINA.h>
+#include <PubSubClient.h>
+#include "credentials.h"
 
-#define PN532_SCK  (13)
-#define PN532_MOSI (11)
-#define PN532_SS   (10)
-#define PN532_MISO (12)
+#include <Servo.h>
+#define SERVO_PIN 9
+Servo myServo;
 
-Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
+#define LED_PIN 17
 
-void setup(void) {
-  Serial.begin(115200);
-  while (!Serial) delay(10);
+#define TOPIC "uark/csce5013/gbgoode"
+#define USERNAME "gbgoode"
+char ssid[] = SSID;
+char password[] = PASSKEY;
+// Status
+int status = WL_IDLE_STATUS;
+const char* mqtt_server = "broker.hivemq.com";
 
-  Serial.println("Hello!");
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
+byte mac[6];  
+long lastMsg = 0;
+char msg[100];
+int value = 0;
 
-  nfc.begin();
+char* Topic;
+char buffer[20];
+boolean Rflag=false;
+int r_len;
 
-  uint32_t versiondata = nfc.getFirmwareVersion();
-  if (! versiondata) {
-    Serial.print("Didn't find PN53x board");
-    while (1); // halt
+void setup_wifi(){
+  delay(1000);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.macAddress(mac);
+  Serial.println();
+  Serial.print("Mac address ");
+  int i = 0;
+  for(i = 0; i<6; i++){
+    Serial.println(mac[i],HEX);
   }
-  // Got ok data, print it out!
-  Serial.print("Found chip PN5"); Serial.println((versiondata>>24) & 0xFF, HEX);
-  Serial.print("Firmware ver. "); Serial.print((versiondata>>16) & 0xFF, DEC);
-  Serial.print('.'); Serial.println((versiondata>>8) & 0xFF, DEC);
+  Serial.println();
+  
+  while (status != WL_CONNECTED) {
+    //status = WiFi.begin(ssid, password);
+    status = WiFi.begin(ssid);
+  }
 
-  Serial.println("Waiting for an ISO14443A Card ...");
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  //Rflag = true; //will use in main loop
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  int i = 0;
+  for (i; i < length; i++) {
+    buffer[i] = (char)payload[i];
+    Serial.print((char)payload[i]);
+  }
+  buffer[i]='\0'; //terminate string
+
+  Serial.println("");
+  if(strcmp(buffer, "open") == 0){
+    Rflag = true;
+    Serial.println("Open lock");
+    //digitalWrite(LED_PIN,LOW);
+  }
+  else{
+    //digitalWrite(LED_PIN,HIGH);
+  }
+}
+
+void reconnect() {
+  // Loop until we're reconnected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect(USERNAME)) {
+      Serial.println("connected");
+      // Once connected, subscribe to input channel
+      client.subscribe(TOPIC);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Beginning program...");
+  
+  myServo.attach(SERVO_PIN);
+  pinMode(LED_PIN, OUTPUT);
+
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
 }
 
 void loop() {
-  uint8_t success;
-  uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
-  uint8_t uidLength;                        // Length of the UID (4 or 7 bytes depending on ISO14443A card type)
-  uint8_t currentblock;                     // Counter to keep track of which block we're on
-  bool authenticated = false;               // Flag to indicate if the sector is authenticated
-  uint8_t data[16];                         // Array to store block data during reads
-  uint8_t storeddata[64][16];               // Array to store all tag data
+  static int servoPosition = 180;
+  static int servoLastChanged = 0;
 
-  // Keyb on NDEF and Mifare Classic should be the same
-  uint8_t keyuniversal[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-
-  // Wait for an ISO14443A type cards (Mifare, etc.).  When one is found
-  // 'uid' will be populated with the UID, and uidLength will indicate
-  // if the uid is 4 bytes (Mifare Classic) or 7 bytes (Mifare Ultralight)
-  success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
-
-  if (success) {
-    Serial.println("Found an ISO14443A card");
-    Serial.print("  UID Length: ");Serial.print(uidLength, DEC);Serial.println(" bytes");
-    Serial.print("  UID Value: ");
-    nfc.PrintHex(uid, uidLength);
-    Serial.println("");
-
-    if (uidLength == 4)
-    {
-      Serial.println("Seems to be a Mifare Classic card (4 byte UID)");
-
-      // Now we try to go through all 16 sectors (each having 4 blocks)
-      // authenticating each sector, and then dumping the blocks
-      for (currentblock = 0; currentblock < 64; currentblock++)
-      {
-        // Check if this is a new block so that we can reauthenticate
-        if (nfc.mifareclassic_IsFirstBlock(currentblock)) authenticated = false;
-
-        // If the sector hasn't been authenticated, do so first
-        if (!authenticated)
-        {
-          // Starting of a new sector ... try to to authenticate
-          Serial.print("------------------------Sector ");Serial.print(currentblock/4, DEC);Serial.println("-------------------------");
-          if (currentblock == 0)
-          {
-              // This will be 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF for Mifare Classic (non-NDEF!)
-              // or 0xA0 0xA1 0xA2 0xA3 0xA4 0xA5 for NDEF formatted cards using key a,
-              // but keyb should be the same for both (0xFF 0xFF 0xFF 0xFF 0xFF 0xFF)
-              success = nfc.mifareclassic_AuthenticateBlock (uid, uidLength, currentblock, 1, keyuniversal);
-          }
-          else
-          {
-              // This will be 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF for Mifare Classic (non-NDEF!)
-              // or 0xD3 0xF7 0xD3 0xF7 0xD3 0xF7 for NDEF formatted cards using key a,
-              // but keyb should be the same for both (0xFF 0xFF 0xFF 0xFF 0xFF 0xFF)
-              success = nfc.mifareclassic_AuthenticateBlock (uid, uidLength, currentblock, 1, keyuniversal);
-          }
-          if (success)
-          {
-            authenticated = true;
-          }
-          else
-          {
-            Serial.println("Authentication error");
-          }
-        }
-        // If we're still not authenticated just skip the block
-        if (!authenticated)
-        {
-          Serial.print("Block ");Serial.print(currentblock, DEC);Serial.println(" unable to authenticate");
-        }
-        else
-        {
-          // Authenticated ... we should be able to read the block now
-          // Dump the data into the 'data' array
-          success = nfc.mifareclassic_ReadDataBlock(currentblock, data);
-          if (success)
-          {
-            // Read successful
-            Serial.print("Block ");Serial.print(currentblock, DEC);
-            if (currentblock < 10)
-            {
-              Serial.print("  ");
-            }
-            else
-            {
-              Serial.print(" ");
-            }
-            // Dump the raw data
-            nfc.PrintHexChar(data, 16);
-            for(int i = 0; i < 16; i++){
-              storeddata[currentblock][i] = data[i];
-            }
-          }
-          else
-          {
-            // Oops ... something happened
-            Serial.print("Block ");Serial.print(currentblock, DEC);
-            Serial.println(" unable to read this block");
-          }
-        }
-      }
-    }
-    else
-    {
-      Serial.println("Ooops ... this doesn't seem to be a Mifare Classic card!");
-    }
+  if (!client.connected()) {
+    reconnect();
   }
-  for(int i = 0; i < 64; i++){
-    nfc.PrintHexChar(storeddata[i], 16);
+  client.loop();
+  if(Rflag)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    myServo.write(0);
+    delay(1000);
+    Rflag = false;
   }
-  
-  //Delay to wait for new card to be written to
-  delay(5000);
-  success = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength);
-
-  if (success) {
-    Serial.println("Found an ISO14443A card");
-    Serial.print("  UID Length: ");Serial.print(uidLength, DEC);Serial.println(" bytes");
-    Serial.print("  UID Value: ");
-    nfc.PrintHex(uid, uidLength);
-    Serial.println("");
-
-    if (uidLength == 4)
-    {
-      Serial.println("Seems to be a Mifare Classic card (4 byte UID)");
-      // Now we try to go through all 16 sectors (each having 4 blocks)
-      // authenticating each sector, and then writing the blocks
-      for (currentblock = 0; currentblock < 64; currentblock++)
-      {
-        // Check if this is a new block so that we can reauthenticate
-        if (nfc.mifareclassic_IsFirstBlock(currentblock)) authenticated = false;
-
-        // If the sector hasn't been authenticated, do so first
-        if (!authenticated)
-        {
-          // Starting of a new sector ... try to to authenticate
-          Serial.print("------------------------Sector ");Serial.print(currentblock/4, DEC);Serial.println("-------------------------");
-          if (currentblock == 0)
-          {
-              // This will be 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF for Mifare Classic (non-NDEF!)
-              // or 0xA0 0xA1 0xA2 0xA3 0xA4 0xA5 for NDEF formatted cards using key a,
-              // but keyb should be the same for both (0xFF 0xFF 0xFF 0xFF 0xFF 0xFF)
-              success = nfc.mifareclassic_AuthenticateBlock (uid, uidLength, currentblock, 1, keyuniversal);
-          }
-          else
-          {
-              // This will be 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF for Mifare Classic (non-NDEF!)
-              // or 0xD3 0xF7 0xD3 0xF7 0xD3 0xF7 for NDEF formatted cards using key a,
-              // but keyb should be the same for both (0xFF 0xFF 0xFF 0xFF 0xFF 0xFF)
-              success = nfc.mifareclassic_AuthenticateBlock (uid, uidLength, currentblock, 1, keyuniversal);
-          }
-          if (success)
-          {
-            authenticated = true;
-          }
-          else
-          {
-            Serial.println("Authentication error");
-          }
-        }
-        // If we're still not authenticated just skip the block
-        if (!authenticated)
-        {
-          Serial.print("Block ");Serial.print(currentblock, DEC);Serial.println(" unable to authenticate");
-        }
-        else
-        {
-          // Authenticated ... we should be able to read the block now
-          // Dump the data into the 'data' array
-          for(int i = 0; i < 16; i++){
-            data[i] = storeddata[currentblock][i];
-          }
-          
-          success = nfc.mifareclassic_WriteDataBlock(currentblock, data);
-          if (success)
-          {
-              Serial.println("Block success");
-          }
-          else
-          {
-            // Oops ... something happened
-            Serial.print("Block ");Serial.print(currentblock, DEC);
-            Serial.println(" unable to write this block");
-          }
-        }
-      }
-    }
-    else
-    {
-      Serial.println("Ooops ... this doesn't seem to be a Mifare Classic card!");
-    }
+  else{
+    digitalWrite(LED_PIN, LOW);
+    myServo.write(180);
   }
-  for(int i = 0; i < 64; i++){
-    nfc.PrintHexChar(storeddata[i], 16);
-  }
-
-  Serial.println("\n\nSend a character to run the mem dumper again!");
-  Serial.flush();
-  while (!Serial.available());
-  while (Serial.available()) {
-  Serial.read();
-  }
-  Serial.flush();
+  //
+  //
+  //delay(1000);
+  //
+  //myServo.write(180);
+  delay(1000);
 }
